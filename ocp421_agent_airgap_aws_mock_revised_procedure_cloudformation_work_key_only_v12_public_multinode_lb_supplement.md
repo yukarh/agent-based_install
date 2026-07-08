@@ -1439,32 +1439,44 @@ ssh -i ~/.ssh/ocp-node-debug core@master-0.ocp.lab.test
 
 ```
 
-次に、oc-mirror が生成した `idms-oc-mirror.yaml` から、`install-config.yaml` に入れる `imageDigestSources` を作成する。
+次に、oc-mirror が生成した `idms-oc-mirror.yaml` を確認し、`install-config.yaml` に入れる `imageDigestSources` を作成する。
 
-```bash
-python3 - <<'PY' > config/imageDigestSources.from-idms.yaml
-from pathlib import Path
-
-idms_file = Path("oc-mirror-work/working-dir/cluster-resources/idms-oc-mirror.yaml")
-
-print("imageDigestSources:")
-
-capture = False
-
-for line in idms_file.read_text().splitlines():
-    if line == "  imageDigestMirrors:":
-        capture = True
-        continue
-
-    if line == "---":
-        capture = False
-        continue
-
-    if capture and (line.startswith("  - ") or line.startswith("    ")):
-        print(line)
-PY
+元ファイルを確認する。
 
 ```
+cat oc-mirror-work/working-dir/cluster-resources/idms-oc-mirror.yaml
+```
+
+`idms-oc-mirror.yaml` には、以下のように `spec.imageDigestMirrors` が出力される。
+
+```
+spec:
+  imageDigestMirrors:
+  - mirrors:
+    - quay.ocp.lab.test:8443/openshift/release
+    source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+  - mirrors:
+    - quay.ocp.lab.test:8443/openshift/release-images
+    source: quay.io/openshift-release-dev/ocp-release
+```
+
+`install-config.yaml` に入れる形式では、先頭を `imageDigestSources:` に置き換え、`imageDigestMirrors` 配下の `mirrors` / `source` を転記する。
+
+```
+cat > config/imageDigestSources.from-idms.yaml <<'EOF'
+imageDigestSources:
+  - mirrors:
+    - quay.ocp.lab.test:8443/openshift/release
+    source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+  - mirrors:
+    - quay.ocp.lab.test:8443/openshift/release-images
+    source: quay.io/openshift-release-dev/ocp-release
+EOF
+```
+
+実際の値は、自分の `idms-oc-mirror.yaml` に出力された内容に合わせる。  
+`apiVersion`、`kind`、`metadata`、`spec`、`imageDigestMirrors` は `install-config.yaml` には入れない。  
+
 
 確認する場合。
 
