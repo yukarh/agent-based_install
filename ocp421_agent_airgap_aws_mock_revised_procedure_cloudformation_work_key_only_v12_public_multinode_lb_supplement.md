@@ -1489,6 +1489,8 @@ imageDigestSources:
 ...
 ```
 
+
+
 ### 11.2 install-config.yaml を生成する
 
 work 側で実行する。
@@ -1496,7 +1498,7 @@ work 側で実行する。
 ```bash
 CA_FILE="$HOME/ocp-airgap/mirror-registry/mirror/quay-rootCA/rootCA.pem"
 PULL_SECRET_JSON="$(jq -c . config/pull-secret.json)"
-SSH_KEY="$(cat config/ssh.pub)"
+SSH_KEY="$(cat ~/.ssh/ocp-node-debug.pub)"
 
 cat > config/install-config.yaml <<EOF
 apiVersion: v1
