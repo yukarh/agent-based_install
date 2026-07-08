@@ -1413,7 +1413,7 @@ oc-mirror v2 が生成する `ImageDigestMirrorSet` の `imageDigestMirrors` を
 `install-config.yaml` に埋め込むため、以下を用意する。
 
 - RHCOS ノードへSSH調査するための公開鍵
-- oc-mirror の IDMS 出力から作成する `imageDigestSources`
+- oc-mirror が生成した IDMS から作成する `imageDigestSources`
 
 `install-config.yaml` の `sshKey` は、work へSSHするための鍵ではない。  
 インストール後、閉域内の作業用ホストから RHCOS ノードの `core` ユーザーへSSH調査するための公開鍵である。
@@ -1426,9 +1426,8 @@ chmod 700 ~/.ssh
 
 ssh-keygen -t ed25519 -N '' -C "ocp-node-debug" -f ~/.ssh/ocp-node-debug
 
-cp ~/.ssh/ocp-node-debug.pub config/ssh.pub
 chmod 600 ~/.ssh/ocp-node-debug
-chmod 644 config/ssh.pub
+chmod 644 ~/.ssh/ocp-node-debug.pub
 
 ```
 
@@ -1443,23 +1442,34 @@ ssh -i ~/.ssh/ocp-node-debug core@master-0.ocp.lab.test
 次に、oc-mirror が生成した `idms-oc-mirror.yaml` から、`install-config.yaml` に入れる `imageDigestSources` を作成する。
 
 ```bash
-{
-  printf 'imageDigestSources:\n'
-  awk '
-    /^  imageDigestMirrors:/ {capture=1; next}
-    /^---/ {capture=0}
-    capture && /^  - / {print}
-    capture && /^    / {print}
-  ' oc-mirror-work/working-dir/cluster-resources/idms-oc-mirror.yaml
-} > config/imageDigestSources.from-idms.yaml
+python3 - <<'PY' > config/imageDigestSources.from-idms.yaml
+from pathlib import Path
+
+idms_file = Path("oc-mirror-work/working-dir/cluster-resources/idms-oc-mirror.yaml")
+
+print("imageDigestSources:")
+
+capture = False
+
+for line in idms_file.read_text().splitlines():
+    if line == "  imageDigestMirrors:":
+        capture = True
+        continue
+
+    if line == "---":
+        capture = False
+        continue
+
+    if capture and (line.startswith("  - ") or line.startswith("    ")):
+        print(line)
+PY
 
 ```
 
 確認する場合。
 
 ```bash
-ls -l ~/.ssh/ocp-node-debug ~/.ssh/ocp-node-debug.pub config/ssh.pub config/imageDigestSources.from-idms.yaml
-cat config/ssh.pub
+cat ~/.ssh/ocp-node-debug.pub
 cat config/imageDigestSources.from-idms.yaml
 
 ```
@@ -1477,7 +1487,6 @@ imageDigestSources:
     - quay.ocp.lab.test:8443/openshift/release-images
     source: quay.io/openshift-release-dev/ocp-release
 ...
-
 ```
 
 ### 11.2 install-config.yaml を生成する
