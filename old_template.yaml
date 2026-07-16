@@ -1,0 +1,511 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OpenShift 4.21 Agent-based Installer airgap AWS mock lab.
+  v3 procedure aligned, no Elastic IP.
+  Uses an existing EC2 KeyPair for SSH to the work EC2.
+  The work EC2 gets an auto-assigned public IPv4 address; the SNO dummy EC2 has no public IP and no NAT route.
+
+Parameters:
+  AdminCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      SSH source CIDR for the work EC2. Default is open for no-input deployment.
+      For safer use, update this to your public IP CIDR, for example 203.0.113.10/32.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+
+  WorkKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ocp-airgap-lab
+    Description: >
+      Existing EC2 KeyPair name for SSH to the work EC2.
+      Create this KeyPair before stack creation and keep the downloaded .pem file on your Mac.
+
+  WorkInstanceType:
+    Type: String
+    Default: m6i.2xlarge
+    Description: Instance type for ocp-airgap-work.
+    AllowedPattern: '^[a-z0-9.]+$'
+
+  SnoInstanceType:
+    Type: String
+    Default: m6i.2xlarge
+    Description: Instance type for ocp-airgap-sno-master0-dummy.
+    AllowedPattern: '^[a-z0-9.]+$'
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.0.0/24
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  WorkPrivateIp:
+    Type: String
+    Default: 10.0.0.10
+
+  SnoPrivateIp:
+    Type: String
+    Default: 10.0.1.10
+
+  WorkRootVolumeSize:
+    Type: Number
+    Default: 500
+    MinValue: 100
+
+  SnoRootVolumeSize:
+    Type: Number
+    Default: 120
+    MinValue: 50
+
+Metadata:
+  OcpAirgapValues:
+    WorkName: ocp-airgap-work
+    SnoName: ocp-airgap-sno-master0-dummy
+    WorkPrivateIp: 10.0.0.10
+    SnoPrivateIp: 10.0.1.10
+    DnsNtpQuayIp: 10.0.0.10
+    RendezvousIp: 10.0.1.10
+    PrivateGateway: 10.0.1.1
+    QuayFqdn: quay.ocp.lab.test:8443
+    ClusterName: ocp
+    BaseDomain: lab.test
+    SnoHostname: master-0.ocp.lab.test
+  Notes:
+    - No Elastic IP is created.
+    - Work EC2 is in the public subnet and receives an auto-assigned public IPv4 address.
+    - Work EC2 uses the existing EC2 KeyPair specified by WorkKeyName.
+    - SNO dummy EC2 is in the private subnet with no public IP, no NAT route, and no KeyName.
+    - SNO MAC is assigned by AWS at creation time and is returned in stack outputs.
+    - Agent ISO boot on AWS EC2 is not covered by this template.
+
+Resources:
+  LookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ec2-lookup-and-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  LookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt LookupRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib.request
+
+          def send(event, context, status, data=None, reason=None, physical_id=None):
+              body = {
+                  "Status": status,
+                  "Reason": reason or ("See CloudWatch Logs: " + context.log_stream_name),
+                  "PhysicalResourceId": physical_id or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data or {},
+              }
+              encoded = json.dumps(body).encode("utf-8")
+              req = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=encoded,
+                  headers={"content-type": "", "content-length": str(len(encoded))},
+                  method="PUT",
+              )
+              urllib.request.urlopen(req, timeout=10)
+
+          def latest_rhel9_ami():
+              ec2 = boto3.client("ec2")
+              resp = ec2.describe_images(
+                  Owners=["309956199498"],
+                  Filters=[
+                      {"Name": "name", "Values": ["RHEL-9*_HVM-*-x86_64-*", "RHEL-9*GA*x86_64*", "RHEL-9*Hourly*x86_64*"]},
+                      {"Name": "architecture", "Values": ["x86_64"]},
+                      {"Name": "root-device-type", "Values": ["ebs"]},
+                      {"Name": "virtualization-type", "Values": ["hvm"]},
+                      {"Name": "state", "Values": ["available"]},
+                  ],
+              )
+              images = sorted(resp.get("Images", []), key=lambda x: x.get("CreationDate", ""), reverse=True)
+              if not images:
+                  raise Exception("No RHEL 9 x86_64 AMI was found in this Region for owner 309956199498.")
+              image = images[0]
+              return {
+                  "ImageId": image["ImageId"],
+                  "Name": image.get("Name", ""),
+                  "CreationDate": image.get("CreationDate", ""),
+              }
+
+          def instance_mac(instance_id):
+              ec2 = boto3.client("ec2")
+              resp = ec2.describe_instances(InstanceIds=[instance_id])
+              inst = resp["Reservations"][0]["Instances"][0]
+              ni = inst["NetworkInterfaces"][0]
+              return {"MacAddress": ni["MacAddress"]}
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      send(event, context, "SUCCESS", {}, physical_id=event.get("PhysicalResourceId"))
+                      return
+                  props = event.get("ResourceProperties", {})
+                  lookup_type = props.get("LookupType")
+                  if lookup_type == "LatestRhel9Ami":
+                      data = latest_rhel9_ami()
+                      send(event, context, "SUCCESS", data, physical_id=data["ImageId"])
+                  elif lookup_type == "InstanceMac":
+                      instance_id = props["InstanceId"]
+                      data = instance_mac(instance_id)
+                      send(event, context, "SUCCESS", data, physical_id=instance_id + "-mac")
+                  else:
+                      raise Exception("Unknown LookupType: " + str(lookup_type))
+              except Exception as exc:
+                  send(event, context, "FAILED", {}, reason=str(exc))
+
+  LatestRhel9Ami:
+    Type: Custom::Ec2Lookup
+    Properties:
+      ServiceToken: !GetAtt LookupFunction.Arn
+      LookupType: LatestRhel9Ami
+
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-public-subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-private-subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-private-rt-no-nat
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  WorkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ocp-airgap-work-sg
+      GroupDescription: ocp airgap work security group
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: SSH from admin source to work EC2
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+        - Description: Quay from VPC
+          IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: !Ref VpcCidr
+        - Description: DNS TCP from VPC
+          IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+        - Description: DNS UDP from VPC
+          IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+        - Description: NTP from VPC
+          IpProtocol: udp
+          FromPort: 123
+          ToPort: 123
+          CidrIp: !Ref VpcCidr
+      SecurityGroupEgress:
+        - Description: Allow all outbound from work EC2
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-work-sg
+
+  SnoSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ocp-airgap-sno-sg
+      GroupDescription: ocp airgap sno dummy security group
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: SSH from work SG
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref WorkSecurityGroup
+        - Description: HTTP from work SG
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WorkSecurityGroup
+        - Description: HTTPS from work SG
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref WorkSecurityGroup
+        - Description: Kubernetes API from work SG
+          IpProtocol: tcp
+          FromPort: 6443
+          ToPort: 6443
+          SourceSecurityGroupId: !Ref WorkSecurityGroup
+        - Description: Machine Config Server from work SG
+          IpProtocol: tcp
+          FromPort: 22623
+          ToPort: 22623
+          SourceSecurityGroupId: !Ref WorkSecurityGroup
+      SecurityGroupEgress:
+        - Description: Allow all outbound within routing constraints
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-sno-sg
+
+  WorkInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - PublicDefaultRoute
+      - LatestRhel9Ami
+    Properties:
+      ImageId: !GetAtt LatestRhel9Ami.ImageId
+      InstanceType: !Ref WorkInstanceType
+      KeyName: !Ref WorkKeyName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref WorkSecurityGroup
+          PrivateIpAddress: !Ref WorkPrivateIp
+          AssociatePublicIpAddress: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref WorkRootVolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          hostnamectl set-hostname work.ocp.lab.test || true
+          mkdir -p /home/ec2-user/ocp-airgap/{config,iso-create,logs,mirror-registry,oc-mirror-work,pkg}
+          chown -R ec2-user:ec2-user /home/ec2-user/ocp-airgap
+          chmod 700 /home/ec2-user/ocp-airgap/logs
+          cat > /home/ec2-user/ocp-airgap/AWS_RESOURCE_VALUES.txt <<EOF
+          WORK_PRIVATE_IP=${WorkPrivateIp}
+          SNO_PRIVATE_IP=${SnoPrivateIp}
+          DNS_IP=${WorkPrivateIp}
+          NTP_IP=${WorkPrivateIp}
+          QUAY_FQDN=quay.ocp.lab.test:8443
+          RENDEZVOUS_IP=${SnoPrivateIp}
+          DEFAULT_GATEWAY=10.0.1.1
+          EOF
+          chown ec2-user:ec2-user /home/ec2-user/ocp-airgap/AWS_RESOURCE_VALUES.txt
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-work
+
+  SnoInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - LatestRhel9Ami
+    Properties:
+      ImageId: !GetAtt LatestRhel9Ami.ImageId
+      InstanceType: !Ref SnoInstanceType
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          SubnetId: !Ref PrivateSubnet
+          GroupSet:
+            - !Ref SnoSecurityGroup
+          PrivateIpAddress: !Ref SnoPrivateIp
+          AssociatePublicIpAddress: false
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref SnoRootVolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -eux
+          hostnamectl set-hostname master-0.ocp.lab.test || true
+      Tags:
+        - Key: Name
+          Value: ocp-airgap-sno-master0-dummy
+
+  SnoMac:
+    Type: Custom::Ec2Lookup
+    DependsOn: SnoInstance
+    Properties:
+      ServiceToken: !GetAtt LookupFunction.Arn
+      LookupType: InstanceMac
+      InstanceId: !Ref SnoInstance
+
+Outputs:
+  VpcId:
+    Description: VPC ID.
+    Value: !Ref Vpc
+
+  PublicSubnetId:
+    Description: Public subnet ID.
+    Value: !Ref PublicSubnet
+
+  PrivateSubnetId:
+    Description: Private subnet ID.
+    Value: !Ref PrivateSubnet
+
+  WorkSecurityGroupId:
+    Description: Work EC2 security group ID.
+    Value: !Ref WorkSecurityGroup
+
+  SnoSecurityGroupId:
+    Description: Dummy SNO EC2 security group ID.
+    Value: !Ref SnoSecurityGroup
+
+  ResolvedRhel9AmiId:
+    Description: Latest RHEL 9 AMI ID resolved in this Region.
+    Value: !GetAtt LatestRhel9Ami.ImageId
+
+  ResolvedRhel9AmiName:
+    Description: Latest RHEL 9 AMI name resolved in this Region.
+    Value: !GetAtt LatestRhel9Ami.Name
+
+  WorkKeyPairName:
+    Description: Existing EC2 KeyPair name used for SSH to the work EC2.
+    Value: !Ref WorkKeyName
+
+  WorkInstanceId:
+    Description: Work EC2 instance ID.
+    Value: !Ref WorkInstance
+
+  SnoInstanceId:
+    Description: Dummy SNO EC2 instance ID.
+    Value: !Ref SnoInstance
+
+  WorkPublicIp:
+    Description: Work EC2 auto-assigned public IPv4 address. No Elastic IP is used.
+    Value: !GetAtt WorkInstance.PublicIp
+
+  WorkPrivateIp:
+    Description: Work EC2 private IP. Used for DNS, NTP, and Quay.
+    Value: !Ref WorkPrivateIp
+
+  SnoPrivateIp:
+    Description: Dummy SNO EC2 private IP and rendezvousIP.
+    Value: !Ref SnoPrivateIp
+
+  SnoMac:
+    Description: Dummy SNO EC2 eth0 MAC address. Put this into config/env.sh as SNO_MAC.
+    Value: !GetAtt SnoMac.MacAddress
+
+  WorkSshCommand:
+    Description: SSH command to the work EC2 using the local .pem file for WorkKeyName.
+    Value: !Sub 'ssh -i ./${WorkKeyName}.pem -o IdentitiesOnly=yes ec2-user@${WorkInstance.PublicIp}'
+
+
+  LabValues:
+    Description: Values expected by ocp421_agent_airgap_aws_mock_revised_procedure_reflected_v2.md.
+    Value: !Sub 'work=10.0.0.10, dns=10.0.0.10, ntp=10.0.0.10, quay=quay.ocp.lab.test:8443, sno=10.0.1.10, rendezvousIP=10.0.1.10, gateway=10.0.1.1, cluster=ocp, baseDomain=lab.test'
