@@ -2421,7 +2421,3 @@ https://console-openshift-console.apps.ocp.lab.example.com
 - [OpenShift Installer release-4.21のinstall-config型定義](https://github.com/openshift/installer/blob/release-4.21/pkg/types/installconfig.go)
 - [Single-node OpenShiftのインストール前要件](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/installing_on_a_single_node/preparing-to-install-sno)
 - [OpenShift Virtualizationのインストール要件](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/virtualization/installing)
-
-構成図の情報量とネットワーク／ホストの表現は、次の公開記事も参考にしています。技術手順と設定値は上記のOpenShift 4.21公式資料を優先します。
-
-- [SCSK NebulaShift「完全AirGAP環境へのインストール方法（oc-mirror編）」](https://www.scsk.jp/sp/nebulashift/cloud-native-square/000098/)
